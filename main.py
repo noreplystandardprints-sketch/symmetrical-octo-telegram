@@ -92,8 +92,8 @@ def _can_execute_trade(side: str, action_name: Optional[str] = None) -> bool:
 #############################################
 
 class Broker(Protocol):
-    def buy(self, symbol: str, quantity: float, price: float | None = None) -> dict: ...
-    def sell(self, symbol: str, quantity: float, price: float | None = None) -> dict: ...
+    def buy(self, symbol: str, quantity: float, price: Optional[float] = None) -> dict: ...
+    def sell(self, symbol: str, quantity: float, price: Optional[float] = None) -> dict: ...
     def get_price(self, symbol: str) -> float: ...
     def min_order(self, symbol: str) -> float: ...
     def get_balance(self) -> float: ...
@@ -107,7 +107,7 @@ class MockBroker:
         MockBroker._order_seq += 1
         return MockBroker._order_seq
 
-    def buy(self, symbol: str, quantity: float, price: float | None = None) -> dict:
+    def buy(self, symbol: str, quantity: float, price: Optional[float] = None) -> dict:
         if not _can_execute_trade('BUY'):
             return {"status": "error", "message": "Permission denied for BUY"}
         p = float(price) if price is not None else (_get_last_price(symbol) or 100.0)
@@ -124,7 +124,7 @@ class MockBroker:
         })
         return {"status": "success", "order_id": self._next_id(), "message": msg}
 
-    def sell(self, symbol: str, quantity: float, price: float | None = None) -> dict:
+    def sell(self, symbol: str, quantity: float, price: Optional[float] = None) -> dict:
         if not _can_execute_trade('SELL'):
             return {"status": "error", "message": "Permission denied for SELL"}
         p = float(price) if price is not None else (_get_last_price(symbol) or 100.0)
@@ -166,7 +166,7 @@ class IBKRBroker:
             p = _get_last_price(symbol)
         return float(p) if p is not None else 0.0
 
-    def buy(self, symbol: str, quantity: float, price: float | None = None) -> dict:
+    def buy(self, symbol: str, quantity: float, price: Optional[float] = None) -> dict:
         if not _can_execute_trade('BUY'):
             return {"status": "error", "message": "Permission denied for BUY"}
         if not _ibkr_connect_if_needed() or _IBStock is None or _IBMarketOrder is None:
@@ -194,7 +194,7 @@ class IBKRBroker:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def sell(self, symbol: str, quantity: float, price: float | None = None) -> dict:
+    def sell(self, symbol: str, quantity: float, price: Optional[float] = None) -> dict:
         if not _can_execute_trade('SELL'):
             return {"status": "error", "message": "Permission denied for SELL"}
         if not _ibkr_connect_if_needed() or _IBStock is None or _IBMarketOrder is None:
@@ -253,7 +253,7 @@ def select_broker(args=None) -> Broker:
     # Default to simulation
     return MockBroker()
 
-    def sell(self, symbol: str, quantity: float, price: float | None = None) -> dict:
+    def sell(self, symbol: str, quantity: float, price: Optional[float] = None) -> dict:
         if not _ibkr_connect_if_needed() or _IBStock is None or _IBMarketOrder is None:
             return {"status": "error", "message": "IBKR not connected or API unavailable"}
         p = float(price) if price is not None else (self.get_price(symbol) or 0.0)
@@ -309,7 +309,7 @@ def retry(func, attempts: int = 3, delay: float = 2.0, *args, **kwargs):
     print("[ERROR] All retry attempts failed.")
     return None
 
-def safe_buy(broker: Broker, symbol: str, quantity: float, price: float | None = None):
+def safe_buy(broker: Broker, symbol: str, quantity: float, price: Optional[float] = None):
     try:
         if not _can_execute_trade('BUY'):
             print("⚠️ Permission denied for BUY; order not submitted.")
@@ -346,7 +346,7 @@ def safe_buy(broker: Broker, symbol: str, quantity: float, price: float | None =
         logging.error(f"Failed order: {e}")
         return None
 
-def safe_sell(broker: Broker, symbol: str, quantity: float, price: float | None = None):
+def safe_sell(broker: Broker, symbol: str, quantity: float, price: Optional[float] = None):
     try:
         if not _can_execute_trade('SELL'):
             print("⚠️ Permission denied for SELL; order not submitted.")
@@ -392,13 +392,17 @@ def _ibkr_connect_if_needed():
     try:
         if not _ib.isConnected():
             _ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID)
+            if not _ib.isConnected():
+                print(f"⚠️ Failed to connect to IBKR at {IBKR_HOST}:{IBKR_PORT}")
+                return False
             _ib.reqMarketDataType(3)
+            print(f"✅ Connected to IBKR at {IBKR_HOST}:{IBKR_PORT}")
         return _ib.isConnected()
     except Exception as e:
         print(f"IBKR connect failed: {e}")
         return False
 
-def _get_ibkr_last_price(symbol: str) -> float | None:
+def _get_ibkr_last_price(symbol: str) -> Optional[float]:
     """Fetch last price from IBKR; returns None on failure."""
     if not _ibkr_connect_if_needed() or _IBStock is None:
         return None
@@ -415,7 +419,25 @@ def _get_ibkr_last_price(symbol: str) -> float | None:
     except Exception:
         return None
 
-def get_price(symbol: str) -> float | None:
+def _get_last_price(symbol: str) -> Optional[float]:
+    """Get last price robustly using yfinance with multiple fallbacks."""
+    try:
+        ticker = yf.Ticker(symbol)
+        # Attempt to get the most recent close price
+        hist = ticker.history(period="1d")
+        if not hist.empty:
+            return hist["Close"].iloc[-1]
+        # Fallback to current price if history is not immediately available
+        info = ticker.info
+        if "currentPrice" in info:
+            return info["currentPrice"]
+        if "regularMarketPrice" in info:
+            return info["regularMarketPrice"]
+    except Exception as e:
+        print(f"Error fetching price for {symbol} from yfinance: {e}")
+    return None
+
+def get_price(symbol: str) -> Optional[float]:
     """Public price fetcher: use IBKR last/close when enabled; returns None on failure."""
     return _get_ibkr_last_price(symbol)
 
@@ -1267,7 +1289,7 @@ def _parse_positions_arg(positions_arg: str | None, tickers: list[str]) -> dict:
     return positions
 
 
-def _get_last_price(t: str) -> float | None:
+def _get_last_price(t: str) -> Optional[float]:
     """Get last price robustly using yfinance with multiple fallbacks.
     Tries fast_info, then progressively longer periods/intervals, then yf.download.
     """
@@ -1363,7 +1385,7 @@ def _get_last_price(t: str) -> float | None:
         return None
 
 
-def do_live_dashboard(tickers: list[str], poll_interval: float = 1.0, positions_arg: str | None = None, compact: bool = False, duration_secs: float | None = None):
+def do_live_dashboard(tickers: list[str], poll_interval: float = 1.0, positions_arg: str | None = None, compact: bool = False, duration_secs: Optional[float] = None):
     """Render a live dashboard that updates price, position, and P&L every poll_interval seconds.
     - positions_arg: 'TICKER:QTY:AVGCOST' entries separated by commas.
     - compact: if True, prints a single-line summary; otherwise prints one line per ticker.
@@ -2336,7 +2358,7 @@ def _save_paper_account(positions: pd.DataFrame, cash_balance: float) -> None:
     except Exception:
         pass
 
-def _paper_buy(symbol: str, shares: float, price: float | None = None) -> str:
+def _paper_buy(symbol: str, shares: float, price: Optional[float] = None) -> str:
     if not _can_execute_trade('BUY'):
         return "Permission denied for BUY."
     positions, cash_balance = _load_paper_account()
@@ -2418,7 +2440,7 @@ def _paper_buy(symbol: str, shares: float, price: float | None = None) -> str:
     _save_paper_account(positions, cash_balance)
     return f"Bought {shares} {symbol} at {price:.2f}. Cash {cash_balance:.2f}."
 
-def _paper_sell(symbol: str, shares: float, price: float | None = None) -> str:
+def _paper_sell(symbol: str, shares: float, price: Optional[float] = None) -> str:
     if not _can_execute_trade('SELL'):
         return "Permission denied for SELL."
     positions, cash_balance = _load_paper_account()
@@ -2861,7 +2883,7 @@ def _save_paper_account(positions: pd.DataFrame, cash_balance: float) -> None:
     except Exception:
         pass
 
-def _paper_buy(symbol: str, shares: float, price: float | None = None) -> str:
+def _paper_buy(symbol: str, shares: float, price: Optional[float] = None) -> str:
     if not _can_execute_trade('BUY'):
         return "Permission denied for BUY; paper trade not executed."
     positions, cash_balance = _load_paper_account()
@@ -2892,7 +2914,7 @@ def _paper_buy(symbol: str, shares: float, price: float | None = None) -> str:
     _save_paper_account(positions, cash_balance)
     return f"Bought {shares} {symbol} at {price:.2f}. Cash {cash_balance:.2f}."
 
-def _paper_sell(symbol: str, shares: float, price: float | None = None) -> str:
+def _paper_sell(symbol: str, shares: float, price: Optional[float] = None) -> str:
     if not _can_execute_trade('SELL'):
         return "Permission denied for SELL; paper trade not executed."
     positions, cash_balance = _load_paper_account()
