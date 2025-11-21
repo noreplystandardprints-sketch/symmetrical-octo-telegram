@@ -194,6 +194,17 @@ class IBKRBroker:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+
+
+    def min_order(self, symbol: str) -> float:
+        # Basic default: 1 share
+        return 1.0
+
+    def get_balance(self) -> float:
+        # Fallback to paper account cash for safety checks in AI loop
+        _, bal = _load_paper_account()
+        return float(bal)
+
     def sell(self, symbol: str, quantity: float, price: Optional[float] = None) -> dict:
         if not _can_execute_trade('SELL'):
             return {"status": "error", "message": "Permission denied for SELL"}
@@ -222,6 +233,10 @@ class IBKRBroker:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+
+
+
+
 def select_broker(args=None) -> Broker:
     """Select broker backend via CLI flag or interactive menu.
     Returns a Broker instance; defaults to MockBroker on invalid or failed selection.
@@ -249,44 +264,6 @@ def select_broker(args=None) -> Broker:
         print(f"IBKR pricing {'enabled' if ok else 'requested but not connected'}; execution {'on' if IBKR_EXECUTE else 'off'}.")
         print(f"✅ Connected to IBKR Paper Trading: {ok}")
         return broker if ok else MockBroker()
-
-    # Default to simulation
-    return MockBroker()
-
-    def sell(self, symbol: str, quantity: float, price: Optional[float] = None) -> dict:
-        if not _ibkr_connect_if_needed() or _IBStock is None or _IBMarketOrder is None:
-            return {"status": "error", "message": "IBKR not connected or API unavailable"}
-        p = float(price) if price is not None else (self.get_price(symbol) or 0.0)
-        try:
-            contract = _IBStock(symbol, 'SMART', 'USD')
-            order = _IBMarketOrder('SELL', int(round(quantity)))
-            trade = _ib.placeOrder(contract, order)
-            _ib.sleep(2)
-            status = getattr(trade.orderStatus, 'status', 'Unknown')
-            _append_trade_log({
-                "symbol": symbol,
-                "action": "SELL",
-                "quantity": float(quantity),
-                "price": float(p),
-                "status": status,
-                "timestamp": str(datetime.now())
-            })
-            if status not in ('Filled', 'Submitted'):
-                print(f"⚠️ Order failed or rejected: {status}")
-            else:
-                print(f"✅ Order successful: {status}")
-            return {"status": status, "order_id": getattr(trade, 'order', None) and getattr(trade.order, 'orderId', None)}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    def min_order(self, symbol: str) -> float:
-        # Basic default: 1 share
-        return 1.0
-
-    def get_balance(self) -> float:
-        # Fallback to paper account cash for safety checks in AI loop
-        _, bal = _load_paper_account()
-        return float(bal)
 
 #############################################
 # Error handling, retry, and safe order helpers
@@ -378,6 +355,11 @@ def safe_sell(broker: Broker, symbol: str, quantity: float, price: Optional[floa
         print(f"[ERROR] Unexpected error: {e}")
         logging.error(f"Failed sell: {e}")
         return None
+        return _ib.isConnected()
+    except Exception as e:
+        print(f"IBKR connect failed: {e}")
+        return False
+
 
 def _ibkr_connect_if_needed():
     """Connect to IBKR using ib_insync if not connected, honoring globals."""
@@ -419,27 +401,14 @@ def _get_ibkr_last_price(symbol: str) -> Optional[float]:
     except Exception:
         return None
 
-def _get_last_price(symbol: str) -> Optional[float]:
-    """Get last price robustly using yfinance with multiple fallbacks."""
-    try:
-        ticker = yf.Ticker(symbol)
-        # Attempt to get the most recent close price
-        hist = ticker.history(period="1d")
-        if not hist.empty:
-            return hist["Close"].iloc[-1]
-        # Fallback to current price if history is not immediately available
-        info = ticker.info
-        if "currentPrice" in info:
-            return info["currentPrice"]
-        if "regularMarketPrice" in info:
-            return info["regularMarketPrice"]
-    except Exception as e:
-        print(f"Error fetching price for {symbol} from yfinance: {e}")
-    return None
+
 
 def get_price(symbol: str) -> Optional[float]:
     """Public price fetcher: use IBKR last/close when enabled; returns None on failure."""
-    return _get_ibkr_last_price(symbol)
+    price = _get_ibkr_last_price(symbol)
+    if price is None:
+        price = _get_last_price(symbol)
+    return price
 
 def buy_stock(symbol: str, shares: int) -> bool:
     """Place a BUY market order on IBKR paper account. Returns True if submitted."""
@@ -515,135 +484,125 @@ class TradingEnv (gym.Env):
         print(f"Observation space shape: {self.observation_space.shape}")
 
     def _download_data(self):
+        self.start = pd.Timestamp(self.start)
+        self.end = pd.Timestamp(self.end)
+
         os.makedirs(self.data_dir, exist_ok=True)
         dfs_to_concat = []
         successful_tickers = []
 
         for ticker in self.tickers:
             csv_path = os.path.join(self.data_dir, f"{ticker}.csv")
+            combined_df = pd.DataFrame()
+
+            # 1. Load existing data from CSV if available
             if os.path.exists(csv_path):
-                df = pd.read_csv(csv_path, index_col=0, parse_dates=True, date_format="%Y-%m-%d")
-                cols = list(df.columns)
-                # Handle prior runs and various CSV header styles
-                if ticker in df.columns:
-                    df = df[[ticker]]
-                elif 'Adj Close' in df.columns:
-                    df = df[['Adj Close']].rename(columns={'Adj Close': ticker})
-                elif 'Close' in df.columns:
-                    df = df[['Close']].rename(columns={'Close': ticker})
+                try:
+                    df_from_csv = pd.read_csv(csv_path, index_col=0, parse_dates=True, date_format="%Y-%m-%d")
+                    # Ensure index is DatetimeIndex and sorted
+                    df_from_csv.index = pd.to_datetime(df_from_csv.index, errors='coerce')
+                    df_from_csv = df_from_csv[~df_from_csv.index.isna()].sort_index()
+                    print(f"Loaded existing {ticker} data from {csv_path} (min: {df_from_csv.index.min()}, max: {df_from_csv.index.max()})")
+                    combined_df = df_from_csv
+                except Exception as e:
+                    print(f"Error loading existing CSV for {ticker}: {e}. Attempting fresh download.")
+
+            # 2. Download data for the requested range
+            print(f"Downloading {ticker} data from {self.start} to {self.end}")
+            try:
+                session = requests.Session(impersonate="chrome")
+                session.verify = False
+
+                downloaded_data = yf.download(
+                    ticker,
+                    start=self.start,
+                    end=self.end,
+                    session=session,
+                    auto_adjust=True,
+                )
+
+                if downloaded_data.empty:
+                    print(f"Warning: No new data found for {ticker} in the requested range. Skipping download for this ticker.")
                 else:
-                    # Fallback: try to match columns that contain expected substrings
-                    price_col = None
-                    for c in df.columns:
-                        if isinstance(c, str):
-                            if 'Adj Close' in c:
-                                price_col = c
-                                break
-                            if 'Close' in c:
-                                price_col = c
-                                break
-                    if price_col is not None:
-                        df = df[[price_col]].rename(columns={price_col: ticker})
-                    elif isinstance(df.columns, pd.MultiIndex):
-                        # Attempt to extract from MultiIndex columns
-                        top = df.columns.get_level_values(0)
+                    # Normalize yfinance output across single and MultiIndex columns
+                    if isinstance(downloaded_data.columns, pd.MultiIndex):
+                        top = downloaded_data.columns.get_level_values(0)
                         if 'Adj Close' in top:
-                            s = df['Adj Close']
+                            df_downloaded = downloaded_data['Adj Close']
                         elif 'Close' in top:
-                            s = df['Close']
+                            df_downloaded = downloaded_data['Close']
                         else:
-                            print(f"Warning: No valid price column found in CSV for {ticker}. Available columns: {cols}. Skipping ticker.")
-                            continue
-                        if ticker in s.columns:
-                            df = s[[ticker]]
+                            print(f"Warning: No valid price column found in downloaded data for {ticker}. Available columns: {downloaded_data.columns.tolist()}. Skipping ticker.")
+                            df_downloaded = pd.DataFrame()
+                    else:
+                        if 'Adj Close' in downloaded_data.columns:
+                            df_downloaded = downloaded_data[['Adj Close']]
+                        elif 'Close' in downloaded_data.columns:
+                            df_downloaded = downloaded_data[['Close']]
                         else:
-                            print(f"Warning: Price column found but ticker {ticker} missing in CSV. Skipping ticker.")
-                            continue
-                # Coerce to numeric and drop any non-numeric rows (e.g., malformed headers)
-                df[ticker] = pd.to_numeric(df[ticker], errors='coerce')
-                df = df.dropna()
-                # Ensure DatetimeIndex and drop any unparseable dates
-                df.index = pd.to_datetime(df.index, errors='coerce')
-                df = df[~df.index.isna()].sort_index()
-                print(f"Loaded {ticker} data from {csv_path}")
-                dfs_to_concat.append(df)
+                            print(f"Warning: No valid price column found in downloaded data for {ticker}. Available columns: {downloaded_data.columns.tolist()}. Skipping ticker.")
+                            df_downloaded = pd.DataFrame()
+
+                    if not df_downloaded.empty:
+                        df_downloaded = df_downloaded.rename(columns={df_downloaded.columns[0]: ticker})
+                        df_downloaded[ticker] = pd.to_numeric(df_downloaded[ticker], errors='coerce')
+                        df_downloaded = df_downloaded.dropna()
+                        df_downloaded.index = pd.to_datetime(df_downloaded.index, errors='coerce')
+                        df_downloaded = df_downloaded[~df_downloaded.index.isna()].sort_index()
+                        print(f"Downloaded new {ticker} data (min: {df_downloaded.index.min()}, max: {df_downloaded.index.max()})")
+
+                        # 3. Combine existing and newly downloaded data
+                        if not combined_df.empty:
+                            combined_df = pd.concat([combined_df, df_downloaded]).drop_duplicates().sort_index()
+                            print(f"Combined {ticker} data (min: {combined_df.index.min()}, max: {combined_df.index.max()})")
+                        else:
+                            combined_df = df_downloaded
+
+            except Exception as e:
+                print(f"Error downloading {ticker} data: {e}")
+                # If download fails, and we have existing CSV data, we can still use it.
+                # If no CSV data either, then this ticker will be skipped.
+
+            # 4. Save the combined data to CSV
+            if not combined_df.empty:
+                combined_df.to_csv(csv_path)
+                print(f"Saved updated {ticker} data to {csv_path}")
+                dfs_to_concat.append(combined_df)
                 successful_tickers.append(ticker)
             else:
-                print(f"Downloading {ticker} data from {self.start} to {self.end}")
-                try:
-                    session = requests.Session(impersonate="chrome")
-                    session.verify = False
+                print(f"No valid data (either from CSV or download) for {ticker}. Skipping ticker.")
+        
+        print(f"Before filtering: self.df shape: {pd.concat(dfs_to_concat, axis=1).shape if dfs_to_concat else 'empty'}")
+        
+        temp_df = pd.concat(dfs_to_concat, axis=1).sort_index()
+        print(f"Temp DataFrame index type: {type(temp_df.index)}")
+        if not temp_df.empty:
+            print(f"Temp DataFrame index min: {temp_df.index.min()}, max: {temp_df.index.max()}")
 
-                    data = yf.download(
-                        ticker,
-                        start=self.start,
-                        end=self.end,
-                        session=session,
-                        auto_adjust=True,
-                    )
+        print(f"Filtering with start: {self.start} and end: {self.end}")
 
-                    if data.empty:
-                        print(f"Warning: No data found for {ticker}. Skipping ticker.")
-                        continue
-                    
-                    data.to_csv(csv_path) # Save the full data to CSV
-                    print(f"Downloaded and saved {ticker} data to {csv_path}")
+        self.df = temp_df.loc[self.start : self.end]  # Ensure data is within the specified range
 
-                    print(f"Downloaded data columns for {ticker}: {data.columns.tolist()}")
-                    # Normalize yfinance output across single and MultiIndex columns
-                    if isinstance(data.columns, pd.MultiIndex):
-                        top = data.columns.get_level_values(0)
-                        if 'Adj Close' in top:
-                            s = data['Adj Close']
-                        elif 'Close' in top:
-                            s = data['Close']
-                        else:
-                            print(f"Warning: No price column found for {ticker}. Skipping ticker.")
-                            os.remove(csv_path)
-                            continue
-                        if ticker in s.columns:
-                            df = s[[ticker]]
-                            df.columns = [ticker]
-                        else:
-                            print(f"Warning: Price column found but ticker {ticker} missing in downloaded data. Skipping ticker.")
-                            os.remove(csv_path)
-                            continue
-                    else:
-                        if 'Adj Close' in data.columns:
-                            df = data[['Adj Close']].rename(columns={'Adj Close': ticker})
-                        elif 'Close' in data.columns:
-                            df = data[['Close']].rename(columns={'Close': ticker})
-                        else:
-                            print(f"Warning: No price column found for {ticker}. Skipping ticker.")
-                            os.remove(csv_path)
-                            continue
-                    # Coerce to numeric and drop any non-numeric rows
-                    df[ticker] = pd.to_numeric(df[ticker], errors='coerce')
-                    df = df.dropna()
-                    # Ensure DatetimeIndex and drop any unparseable dates
-                    df.index = pd.to_datetime(df.index, errors='coerce')
-                    df = df[~df.index.isna()].sort_index()
-                    dfs_to_concat.append(df)
-                    successful_tickers.append(ticker)
-                except Exception as e:
-                    print(f"Error downloading {ticker} data: {e}")
-                    continue
+        if self.df.empty:
+            raise ValueError(f"No data found for the specified date range ({self.start} to {self.end}) after filtering.")
 
-        if not dfs_to_concat:
-            raise ValueError("No valid data downloaded for any tickers!")
+        self.prices = self.df.values
+        self.tickers = successful_tickers  # Update tickers to only include successfully downloaded ones
+        print(f"Successfully downloaded data for tickers: {self.tickers}")
+        print(f"Final data shape: {self.df.shape}")
+        return self.df
 
-        all_data = pd.concat(dfs_to_concat, axis=1)
-        self.tickers = successful_tickers
-        all_data = all_data.astype(np.float32)
-        self.prices = all_data.values
-        self.dates = all_data.index
-        return all_data.dropna()
+    def step(self, action):
+        # Implement the logic for taking a step in the environment
+        # This will involve updating the environment state based on the action
+        # and returning observation, reward, done, info
+        pass
 
-        all_data = all_data.astype(np.float32)
-        self.prices = all_data.values
-        self.dates = all_data.index
-        return all_data.dropna()
-
+    def reset(self, seed=None, options=None):
+        # Implement the logic for resetting the environment to an initial state
+        # This will involve resetting balance, portfolio, shares held, etc.
+        # and returning initial observation and info
+        super().reset(seed=seed)
     def _next_observation(self):
         obs = []
         for i, ticker in enumerate(self.tickers):
